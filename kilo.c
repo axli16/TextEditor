@@ -1,10 +1,16 @@
 /*** includes ***/
+
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -28,10 +34,17 @@ enum editorKey {
 
 /*** data ***/
 
+typedef struct erow {
+  int size; 
+  char *chars;
+} erow;
+
 struct editorConfig {
     int cx, cy;
     int screenrows;
     int screencols;
+    int numrows; 
+    erow *row;
     struct termios orig_termios;
 };
 
@@ -39,30 +52,53 @@ struct editorConfig E;
 
 /*** terminal ***/
 void die(const char *s){
+    // escape codes \x1b
+    // [2J: Erase display/ clear screen 
+    // [H: Move cursor to home (row 1, col 1)
     write(STDOUT_FILENO, "\x1b[2J", 4);
     write(STDOUT_FILENO, "\x1b[H", 3);
     
+    //reads any error message passed to function 
     perror(s);
     exit(1);
 }
 
 void disableRawMode() {
+    //STDIN_FILENO: input 
+    //TCSAFLUSH: switch to raw mode after flushing the input buffer - but allow any output to be written 
+    //tcsetattr(fd, optional_actions, termios_p): change terminal attributes
+    //  fd: file descriptor 
+    //  optional_actions: what to do 
+    //  termios_p: pointer to terminal settings
+    //  returns -1 if fails  
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios) == -1)
         die("tcsetattr");
     
 }
 void enableRawMode(){
+    // get the attribute of the terminal and store it in termios_p
     if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
-    atexit(disableRawMode);
+    atexit(disableRawMode); // if anything stops the program reset terminal mode 
 
-    struct termios raw = E.orig_termios; 
+    struct termios raw = E.orig_termios; //new termios settings
 
+    //Setting flags to terminal settings 
+    // &~ clearing 
+    // | setting 
+    // Disables: Line buffering, Echo, IO processing, 
+    // Avoid signals sent on break(like Ctr+C) / Want raw character /  / Don't strip 8-bit input(Unicode) / Prevents weird pauses
     raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    // Handle output ourselves
     raw.c_oflag &= ~(OPOST);
-    raw.c_cflag |= (CS8);
+    // Ensure full byte width for character input
+    raw.c_cflag |= (CS8); 
+    // No echo / enable reading byte-by-byte / No special line editing (Ctrl-V) / Full control over Ctrl- keys 
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
+    // Min bytes to read 0 = none
     raw.c_cc[VMIN] = 0;
+    // timeout: 0.1s before returning read() 
     raw.c_cc[VTIME] = 1;
+    //Set terminal settings 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
 }
 
@@ -134,16 +170,52 @@ int getCursorPosition(int *rows, int *cols){
 int getWindowSize(int *rows, int *cols) {
     struct winsize ws;
 
+    // Try to get window size
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0){
+        // If it failed move cursor far right and down
         if (write(STDOUT_FILENO, "\x1b[999C\x1b[999B", 12) != 12) return -1;
         return getCursorPosition(rows, cols);
         return -1;
     }else {
+        // Succeeded: set rows and col: accessing memory address value
         *cols = ws.ws_col;
         *rows = ws.ws_row;
         return 0;
     }
 }
+
+
+/*** row operations ***/
+
+void editorAppendRow(char *s, size_t len) {
+  E.row = realloc(E.row, sizeof(erow) * (E.numrows + 1));
+  int at = E.numrows;
+  E.row[at].size = len;
+  E.row[at].chars = malloc(len + 1);
+  memcpy(E.row[at].chars, s, len);
+  E.row[at].chars[len] = '\0';
+  E.numrows++;
+}
+/*** file i/o ***/
+
+void editorOpen(char *filename) {
+  // Open a file 
+  FILE *fp = fopen(filename, "r");
+  if (!fp) die("fopen");
+  char *line = NULL;
+  size_t linecap = 0;
+  ssize_t linelen;
+  //Copy file Contents and add to visual
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    while (linelen > 0 && (line[linelen - 1] == '\n' ||
+                           line[linelen - 1] == '\r'))
+      linelen--;
+    editorAppendRow(line, linelen);
+  }
+  free(line);
+  fclose(fp);
+}
+
 /*** append buffer ***/
 
 struct abuf {
@@ -153,13 +225,16 @@ struct abuf {
 
 #define ABUF_INIT {NULL,0}
 
+// buffer append helper 
 void abAppend(struct abuf *ab, const char *s, int len) {
-    char *new = realloc(ab->b, ab->len + len);
+    char *new = realloc(ab->b, ab->len + len); // resize buffer
     if (new == NULL) return;
-    memcpy(&new[ab->len], s, len);
+    memcpy(&new[ab->len], s, len); // Copy to buffer 
+    // Point buffer pointer to where the new string is in memory and keep track of length 
     ab->b = new;
     ab->len += len;
 }
+// Free memory of buffer and what ever it was holding
 void abFree(struct abuf *ab) {
     free(ab->b);
 }
@@ -169,20 +244,26 @@ void abFree(struct abuf *ab) {
 void editorDrawRows(struct abuf *ab) {
   int y;
   for (y = 0; y < E.screenrows; y++) {
-    if (y == E.screenrows / 3) {
-      char welcome[80];
-      int welcomelen = snprintf(welcome, sizeof(welcome),
-        "Kilo editor -- version %s", KILO_VERSION);
-      if (welcomelen > E.screencols) welcomelen = E.screencols;
-      int padding = (E.screencols - welcomelen) / 2;
-      if (padding) {
+    if (y >= E.numrows) {
+      if (E.numrows == 0 && y == E.screenrows / 3) {
+        char welcome[80];
+        int welcomelen = snprintf(welcome, sizeof(welcome),
+          "Kilo editor -- version %s", KILO_VERSION);
+        if (welcomelen > E.screencols) welcomelen = E.screencols;
+        int padding = (E.screencols - welcomelen) / 2;
+        if (padding) {
+          abAppend(ab, "~", 1);
+          padding--;
+        }
+        while (padding--) abAppend(ab, " ", 1);
+        abAppend(ab, welcome, welcomelen);
+      } else {
         abAppend(ab, "~", 1);
-        padding--;
       }
-      while (padding--) abAppend(ab, " ", 1);
-      abAppend(ab, welcome, welcomelen);
     } else {
-      abAppend(ab, "~", 1);
+      int len = E.row[y].size;
+      if (len > E.screencols) len = E.screencols;
+      abAppend(ab, E.row[y].chars, len);
     }
     abAppend(ab, "\x1b[K", 3);
     if (y < E.screenrows - 1) {
@@ -191,22 +272,24 @@ void editorDrawRows(struct abuf *ab) {
   }
 }
 
+// Buffers cursor movement and drawing to do all at once, when flushing buffer
 void editorRefreshScreen() {
     struct abuf ab = ABUF_INIT;
 
-    abAppend(&ab, "\x1b[?25l", 6);
-    abAppend(&ab, "\x1b[H", 3);
+    abAppend(&ab, "\x1b[?25l", 6); //hide cursor
+    abAppend(&ab, "\x1b[H", 3); // move to home
 
-    editorDrawRows(&ab);
+    editorDrawRows(&ab); 
 
+    // Buffering cursor movement
     char buf[32];
-    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1);
-    abAppend(&ab, buf, strlen(buf));
+    snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.cy + 1, E.cx + 1); 
+    abAppend(&ab, buf, strlen(buf)); 
 
-    abAppend(&ab, "\x1b[H", 3);
-    abAppend(&ab, "\x1b[?25h", 6);
+    abAppend(&ab, "\x1b[H", 3); // move cursor to home 
+    abAppend(&ab, "\x1b[?25h", 6); //reveal cursor
 
-    write(STDOUT_FILENO, ab.b, ab.len);
+    write(STDOUT_FILENO, ab.b, ab.len); // write everything in buffer
     abFree(&ab);
 }
 
@@ -274,14 +357,21 @@ void editorProcessKeypress() {
 /*** init ***/
 
 void initEditor() {
+    // Set current cursor position 
     E.cx = 0; 
     E.cy = 0;
+    E.numrows = 0;
+    E.row = NULL;
 
+    // Set the window size, passing memory address of those values to be changed
     if (getWindowSize(&E.screenrows, &E.screencols) == -1) die("getWindowSize");
 }
-int main() {
+int main(int argc, char *argv[]) {
     enableRawMode();
     initEditor();
+    if (argc >= 2) {
+      editorOpen(argv[1]);
+    }
 
     while (1){
         editorRefreshScreen();
